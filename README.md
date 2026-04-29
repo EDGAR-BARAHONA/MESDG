@@ -1,4 +1,4 @@
-# MESDG#
+# MESDG
 Este repositorio contiene el notebook y los datos necesarios para replicar la investigación titulada "Modelado espacial de la susceptibilidad a la deforestación en el departamentodel Guaviare, Colombia."
 
 📂 Los datos utilizados en este proyecto están disponibles [aquí](https://drive.google.com/drive/folders/1JcDptGlBJ-EYNWXwlMK5hJU7fuya_8bU?usp=drive_link). En esta carpeta se encuentran los archivos raster relacionado a los factores condicionantes usados en la investigación, asi como el dataset usado para en análisis exploratorio de datos y entrenamiento de modelos.
