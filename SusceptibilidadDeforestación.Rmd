@@ -1,0 +1,2172 @@
+---
+title: "Modelado espacial de la susceptibilidad a la deforestación en el departamento del Guaviare"
+author: "Edgar Barahona Candidato a M.Sc EN Geomatica - Universidad Nacional"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+# 1. Carga de Librerías y Dependencias
+
+En este bloque se cargan todas las librerías necesarias para el análisis espacial, modelado estadístico, análisis de patrones de puntos y evaluación de modelos, eliminando duplicados para optimizar la memoria.
+
+```{r librerias, message=FALSE, warning=FALSE}
+
+library(sf)
+library(sp)
+library(raster)
+library(ggplot2)
+library(spdep)
+library(ncf)     
+library(reshape2)
+library(MASS)
+library(dplyr)
+library(tidyr)
+library(spatstat.geom)
+library(spatstat.explore)
+library(caret)   
+library(pROC)    
+library(car)
+library(terra)
+library(INLA)
+```
+
+Aquí se realiza la lectura del dataset principal que contiene las variables y la variable respuesta (Deforestac), así como el límite administrativo del departamento del Guaviare.
+
+```{r}
+
+data_sf <- st_read("D:/Tesis Maestria/VariablesProyecto/DATASET.shp")
+```
+
+# 2. Analisis EDA/ ESDA
+
+Este bloque genera una representación visual de la distribución de los puntos de deforestación (clase 1) versus puntos de no deforestación (clase 0).
+
+```{r}
+datasf <- data_sf
+datasf <- st_transform(datasf, 4326)
+
+guaviare <- st_read("D:/Tesis Maestria/Limite/Guaviare.shp")
+guaviare <- st_transform(guaviare, 4326)
+
+bbox <- st_bbox(guaviare)
+
+p <- ggplot() +
+  geom_sf(data = datasf, aes(color = as.factor(Deforestac)), size = 0.7, alpha = 0.6) +
+  scale_color_manual(values = c("0" = "gray70", "1" = "#B30000"), 
+                     name = "Deforestación", labels = c("0" = "No", "1" = "Sí")) +
+  geom_sf(data = guaviare, fill = NA, color = "black", linewidth = 0.3) +
+  coord_sf(xlim = c(bbox$xmin, bbox$xmax), ylim = c(bbox$ymin, bbox$ymax), expand = FALSE) +
+  guides(color = guide_legend(override.aes = list(size = 2))) +
+  labs(title = "Puntos de deforestación", x = "Longitud", y = "Latitud") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(), plot.title = element_text(face = "bold"), legend.position = c(0.85, 0.25))
+
+print(p)
+
+ggsave("D:/Edgar/Maestria/Semestre 3/Seminario II/Img/puntos_deforestacion.png", p, width = 7, height = 5, dpi = 600)
+```
+
+Extracción de coordenadas y definición de la variable dependiente para los análisis estadísticos posteriores.
+
+```{r}
+coords <- st_coordinates(data_sf)
+
+# Variable respuesta (deforestación binaria)
+y <- data_sf$y
+
+```
+
+Se analizan los predictores ambientales y antrópicos específicamente para los casos donde hubo deforestación. Este análisis permite identificar los rangos de distancia, temperatura o pendiente donde la pérdida de cobertura es más crítica.
+
+```{r}
+
+# Preparación de datos
+variables <- c("DisZa_Medi", "Dis_Ap", "Aspect", "Temp_Media", "Prec_Media", "slope", 
+               "DistDre", "DistVias", "DensPobl", "DisRios", "Dis_CP", "DEM")
+
+xlabs <- list(DisZa_Medi = "Distancia (m)", Dis_Ap = "Distancia (m)", Aspect = "Grados (0–360)",
+              Temp_Media = "Temperatura (°C)", Prec_Media = "Precipitación (mm)", 
+              slope = "Pendiente (°)", DistDre = "Distancia (m)", DistVias = "Distancia (m)",
+              DensPobl = "Personas/km²", DisRios = "Distancia (m)", Dis_CP = "Distancia (m)",
+              DEM = "Elevación (msnm)")
+
+gdf_hist_df <- sf::st_drop_geometry(data_sf)
+
+# Ajuste de márgenes: c(abajo, izquierda, arriba, derecha)
+par(mfrow = c(3, 4), mar = c(4, 4, 2, 1))
+
+for (v in variables) {
+  hist(gdf_hist_df[[v]], 
+       main = v, 
+       col = "steelblue", 
+       border = "white", 
+       breaks = 30, 
+       xlab = xlabs[[v]],
+       cex.main = 0.9,  # Tamaño de título más pequeño
+       cex.lab = 0.8)   # Tamaño de etiquetas más pequeño
+}
+```
+
+A diferencia de los histogramas, este bloque utiliza curvas de densidad para comparar cómo se comportan las variables en ambas clases. Esto permite visualizar si una variable tiene un comportamiento distinto en zonas deforestadas, lo cual es clave para su selección en el modelo.
+
+```{r}
+variables <- c("DisZa_Medi", "Dis_Ap", "Aspect", "Prec_Media", "Temp_Media",
+               "slope", "DistDre", "DistVias", "DensPobl", "DisRios", "Dis_CP", "DEM")
+
+# Formato largo para facet
+df_long <- st_drop_geometry(datasf) %>%
+  select(all_of(variables), Deforestac) %>%
+  mutate(Deforestac = factor(Deforestac,
+                             levels = c(0, 1),
+                             labels = c("No deforestación", "Deforestación"))) %>%
+  pivot_longer(cols      = all_of(variables),
+               names_to  = "Variable",
+               values_to = "Valor")
+
+# Plot
+p_kde <- ggplot(df_long, aes(x = Valor, fill = Deforestac, color = Deforestac)) +
+  
+  geom_density(alpha = 0.4, linewidth = 0.7) +
+  
+  scale_fill_manual(
+    values = c("No deforestación" = "#2166AC",
+               "Deforestación"    = "#B30000")
+  ) +
+  scale_color_manual(
+    values = c("No deforestación" = "#2166AC",
+               "Deforestación"    = "#B30000")
+  ) +
+  facet_wrap(~ Variable, scales = "free", ncol = 3) +
+  labs(
+    title    = "Distribución de variables por clase",
+    subtitle = "Kernel Density Estimation (KDE)",
+    x        = "",
+    y        = "Densidad",
+    fill     = "",
+    color    = ""
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(face = "bold"),
+    legend.position  = "bottom",
+    strip.text       = element_text(face = "bold", size = 9)
+  )
+
+print(p_kde)
+
+ggsave(
+  filename = "D:/Edgar/Maestria/Semestre 3/Seminario II/Img/kde_variables.png",
+  plot     = p_kde,
+  width    = 12,
+  height   = 12,
+  dpi      = 600
+)
+```
+
+Se calculan las matrices de correlación de Pearson y Spearman para detectar relaciones lineales y no lineales entre predictores
+
+```{r}
+variables <- c("DisZa_Medi", "Dis_Ap", "Aspect", "Temp_Media", "Prec_Media",
+               "slope", "DistDre", "DistVias", "DensPobl", "DisRios", "Dis_CP",
+               "DEM")
+gdf <- datasf[datasf$Deforestac == 1, ]
+
+# Correlación de Pearson
+corr <- cor(st_drop_geometry(gdf)[, variables], method = "pearson", use = "complete.obs")
+
+# Formato largo para ggplot
+corr_long <- melt(corr)
+
+# Plot
+p_corr <- ggplot(corr_long, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(value, 2)),
+            size  = 3,
+            color = "black") +
+  scale_fill_gradient2(
+    low      = "#2166AC",
+    mid      = "white",
+    high     = "#B30000",
+    midpoint = 0,
+    limits   = c(-1, 1),
+    name     = "Pearson r",
+    guide    = guide_colorbar(
+    barheight = 15,  # aumenta este valor para hacerla más larga
+    barwidth  = 1.2
+    )
+  ) +
+  coord_fixed() +
+  labs(
+    title    = "Correlación entre variables - Pearson",
+    subtitle = "Puntos de deforestación",
+    x        = "",
+    y        = ""
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1),
+    axis.text.y  = element_text(angle = 0),
+    panel.grid   = element_blank(),
+    plot.title   = element_text(face = "bold"),
+    plot.margin = unit(c(2, 2, 2, 2), "mm"),
+    aspect.ratio = 1)
+
+print(p_corr)
+
+ggsave(
+  filename = "D:/Edgar/Maestria/Semestre 3/Seminario II/Img/correlacion_pearson.png",
+  plot     = p_corr,
+  width    = 8,
+  height   = 7,
+  dpi      = 300
+)
+```
+
+```{r}
+# Correlación de Spearman
+corr <- cor(st_drop_geometry(gdf)[, variables], method = "spearman", use = "complete.obs")
+
+# Formato largo para ggplot
+corr_long <- melt(corr)
+
+# Plot
+p_spearman <- ggplot(corr_long, aes(x = Var1, y = Var2, fill = value)) +
+  
+  geom_tile(color = "white", linewidth = 0.5) +
+  
+  geom_text(aes(label = round(value, 2)),
+            size  = 3,
+            color = "black") +
+  
+  scale_fill_gradient2(
+    low      = "#2166AC",
+    mid      = "white",
+    high     = "#B30000",
+    midpoint = 0,
+    limits   = c(-1, 1),
+    name     = "Spearman r",
+    guide    = guide_colorbar(
+      barheight = 15,
+      barwidth  = 1.2
+    )
+  ) +
+  
+  coord_fixed() +
+  
+  labs(
+    title    = "Correlación entre variables - Spearman",
+    subtitle = "Puntos de deforestación",
+    x        = "",
+    y        = ""
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(angle = 0),
+    panel.grid  = element_blank(),
+    plot.title  = element_text(face = "bold"),
+      plot.margin = unit(c(2, 2, 2, 2), "mm"),
+    aspect.ratio = 1
+  )
+print(p_spearman)
+
+ggsave(
+  filename = "D:/Edgar/Maestria/Semestre 3/Seminario II/Img/correlacion_spearman.png",
+  plot     = p_spearman,
+  width    = 8,
+  height   = 7,
+  dpi      = 600,
+)
+```
+
+Se calcula el VIF (Factor de Inflación de la Varianza) para cuantificar la multicolinealidad.
+
+```{r}
+
+
+variables <- c("DisZa_Medi", "Dis_Ap", "Aspect", "Prec_Media", "Temp_Media",
+               "slope", "DistDre", "DistVias", "DensPobl", "DisRios", "Dis_CP",
+               "DEM")
+datasf <- data_sf
+datasf <- datasf[datasf$Deforestac == 1, ]
+
+# Dataset completo (0s y 1s)
+X <- st_drop_geometry(datasf)[, variables]
+X <- na.omit(X)
+
+modelo_vif <- lm(DisZa_Medi ~ ., data = X)
+vif_result <- vif(modelo_vif)
+
+vif_df <- data.frame(
+  Variable = names(vif_result),
+  VIF      = as.numeric(vif_result)
+)
+vif_df <- vif_df[order(vif_df$VIF, decreasing = TRUE), ]
+
+print(vif_df)
+```
+
+Este bloque implementa el método de Frequency Ratio (FR), discretizando las variables en quintiles para calcular el Prediction Ratio (PR). Es una técnica de peso de evidencia que jerarquiza cuáles variables explican mejor el fenómeno de deforestación.
+
+```{r}
+
+
+# -----------------------------
+# 1. VARIABLES
+# -----------------------------
+variables <- c("DisZa_Medi", "Dis_Ap", "Aspect", "Prec_Media", "Temp_Media",
+               "slope", "DistDre", "DistVias", "DensPobl", "DisRios", "Dis_CP", "DEM")
+
+datasf<- data_sf
+df <- st_drop_geometry(datasf)
+
+
+n_bins <- 5
+
+df_binned <- df %>%
+  mutate(across(all_of(variables),
+                ~ {
+                  breaks <- unique(quantile(., probs = seq(0, 1, 1/n_bins), na.rm = TRUE))
+                  if (length(breaks) < 2) {
+                    as.factor(.)  # si no hay suficientes breaks, dejar como está
+                  } else {
+                    cut(., breaks = breaks, include.lowest = TRUE)
+                  }
+                }))
+
+
+resultados <- lapply(variables, function(var) {
+  
+  total_freq <- df_binned %>%
+    count(.data[[var]]) %>%
+    mutate(Freq_Total = n / sum(n)) %>%
+    rename(bin = 1)
+  
+  defor_freq <- df_binned %>%
+    filter(Deforestac == 1) %>%
+    count(.data[[var]]) %>%
+    mutate(Freq_Defor = n / sum(n)) %>%
+    rename(bin = 1)
+  
+  full_join(total_freq, defor_freq, by = "bin") %>%
+    mutate(
+      Freq_Total = replace_na(Freq_Total, 0),
+      Freq_Defor = replace_na(Freq_Defor, 0),
+      FR         = ifelse(Freq_Total == 0, NA, Freq_Defor / Freq_Total),
+      Variable   = var
+    ) %>%
+    select(Variable, bin, Freq_Total, Freq_Defor, FR)
+})
+
+FR_total <- bind_rows(resultados)
+
+
+tabla <- FR_total %>%
+  group_by(Variable) %>%
+  summarise(
+    MaxRF = max(FR, na.rm = TRUE),
+    MinRF = min(FR, na.rm = TRUE)
+  ) %>%
+  mutate(
+    `MaxRF-MinRF`       = MaxRF - MinRF,
+    `(MaxRF-MinRF)*MinRF` = `MaxRF-MinRF` * MinRF,
+    PR                  = MaxRF / MinRF
+  ) %>%
+  arrange(desc(PR)) %>%
+  mutate(Ranking = row_number()) %>%
+  relocate(Ranking)
+
+
+cat("\n===== TABLA FINAL (TIPO FR) =====\n\n")
+print(tabla)
+
+
+write.csv(tabla,
+          "D:/Edgar/Maestria/Semestre 3/Seminario II/Img/tabla_FR.csv",
+          row.names = FALSE)
+```
+
+Este codigo genera la imagen relacionada a los factores de importancia.
+
+```{r}
+
+# Datos
+data_pr <- data.frame(
+  Variable = c("DisZa_Medi", "DistVias", "Prec_Media", "Temp_Media", "Dis_CP",
+               "DensPobl", "Dis_Ap", "DisRios", "DEM", "slope", "DistDre", "Aspect"),
+  PR       = c(40.075812, 16.773899, 6.700826, 5.658990, 5.584124,
+               3.386446, 2.033770, 1.807960, 1.533317, 1.246428, 1.101872, 1.093783)
+)
+# Ordenar por PR
+data_pr <- data_pr %>%
+  arrange(desc(PR)) %>%
+  mutate(Variable = factor(Variable, levels = rev(Variable)))
+
+# Plot
+p_pr <- ggplot(data_pr, aes(x = PR, y = Variable)) +
+  geom_bar(stat     = "identity",
+           fill     = "#B30000",
+           width    = 0.7) +
+  geom_text(aes(label = round(PR, 2)),
+            hjust = -0.1,
+            size  = 3) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Importancia de Variables - Frequency Ratio",
+    subtitle = "Prediction Ratio (PR) por variable",
+    x        = "PR",
+    y        = "Variable"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_line(color = "grey90", linewidth = 0.3),
+    panel.grid.minor   = element_blank(),
+    plot.title         = element_text(face = "bold")
+  )
+
+print(p_pr)
+
+ggsave(
+  filename = "D:/Edgar/Maestria/Semestre 3/Seminario II/Img/PR_variables.png",
+  plot     = p_pr,
+  width    = 8,
+  height   = 6,
+  dpi      = 300,
+)
+
+```
+
+## 2.1 ESDA
+
+Para el analisis de la configuración espacial de los focos de deforestacióon se utiliza la estimación de densidad kernel para observar cómo se superponen las variables entre las zonas con y sin deforestación. Es una herramienta clave para la selección de predictores.
+
+```{r}
+
+datasf<- data_sf
+gdf <- datasf[datasf$Deforestac == 1, ]
+gdf <- st_transform(gdf, 4326)
+
+coords <- st_coordinates(gdf)
+x <- coords[,1]
+y <- coords[,2]
+
+
+guaviare <- st_read("D:/Tesis Maestria/Limite/Guaviare.shp")
+guaviare <- st_transform(guaviare, 4326)
+
+# bbox del polígono (solo para referencia visual)
+bbox <- st_bbox(guaviare)
+
+
+kde <- MASS::kde2d(
+  x, y,
+  n = 250,
+  h = c(sd(x)*0.1, sd(y)*0.1)
+)
+
+df_kde <- expand.grid(x = kde$x, y = kde$y)
+df_kde$z <- as.vector(kde$z)
+
+
+p <- ggplot() +
+  geom_raster(data = df_kde,
+              aes(x = x, y = y, fill = z)) +
+  geom_sf(data = guaviare,
+          fill = NA,
+          color = "black",
+          linewidth = 0.3) +
+  scale_fill_gradient(
+    low = "white",
+    high = "#B30000",
+    name = "Densidad"
+  ) +
+  coord_sf(
+    xlim = c(bbox$xmin, bbox$xmax),
+    ylim = c(bbox$ymin, bbox$ymax),
+    expand = FALSE
+  ) +
+  labs(
+    title = "Densidad espacial de deforestación",
+    subtitle = "Kernel Density Estimation (KDE 2D)",
+    x = "Longitud",
+    y = "Latitud"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid = element_blank(),
+    panel.ontop      = TRUE,
+    #panel.background = element_rect(fill = NA),
+    plot.title = element_text(face = "bold"), 
+    legend.position  = c(0.85, 0.25) 
+  )
+
+print(p)
+
+ggsave(
+  filename = "D:/Edgar/Maestria/Semestre 3/Seminario II/Img/kde_deforestacion.png",
+  plot     = p,
+  width    = 7,
+  height   = 5,
+  dpi      = 600
+)
+```
+
+Els siguiene bloque calcula el coheficiente de Moran para verficar la existencia de clusters en la agrupación de zonas deforestadas
+
+```{r}
+# Sobre toda la muestra
+gdf_all <- data_sf  # UTM Colombia
+coords_all <- st_coordinates(gdf_all)
+
+k <- 10
+knn_all <- knearneigh(coords_all, k = k)
+nb_all  <- knn2nb(knn_all)
+lw_all  <- nb2listw(nb_all, style = "W")
+
+y_all <- gdf_all$Deforestac  # variable binaria 0/1
+
+moran_global_all <- moran.test(y_all, lw_all)
+print(moran_global_all)
+
+```
+
+Identificación de clusters espaciales significativos mediante el Índice de Moran Local. Este bloque clasifica los puntos en "High-High" para localizar focos críticos de deforestación.
+
+```{r}
+
+# Usar el dataset completo (con 0s y 1s)
+gdfIm <- data_sf
+gdfIm <- st_transform(gdfIm, 4326)
+coords <- st_coordinates(gdfIm)
+
+k <- 20
+knn <- knearneigh(coords, k = k)
+nb  <- knn2nb(knn)
+lw  <- nb2listw(nb, style = "W")
+
+# Variable binaria del dataset completo
+y <- as.numeric(gdfIm$Deforestac)
+
+# Local Moran
+local_moran <- localmoran(y, lw)
+
+# Agregar resultados al spatial dataframe
+gdfIm$Ii   <- local_moran[, 1]   # Indice local
+gdfIm$Z_Ii <- local_moran[, 4]   # Z-score
+gdfIm$p_val <- local_moran[, 5]  # p-valor
+
+# Clasificar clusters LISA
+gdfIm$mean_y <- y - mean(y)  # desviacion de la media
+
+gdfIm$cluster <- "No significativo"
+gdfIm$cluster[gdfIm$Z_Ii > 1.96  & gdfIm$mean_y > 0] <- "High-High"
+gdfIm$cluster[gdfIm$Z_Ii > 1.96  & gdfIm$mean_y < 0] <- "Low-Low"
+gdfIm$cluster[gdfIm$Z_Ii < -1.96 & gdfIm$mean_y > 0] <- "High-Low"
+gdfIm$cluster[gdfIm$Z_Ii < -1.96 & gdfIm$mean_y < 0] <- "Low-High"
+
+# Mapa LISA
+library(ggplot2)
+
+ggplot() +
+  
+  geom_sf(data = gdfIm,
+          aes(color = cluster),
+          size = 0.8) +
+  
+  geom_sf(data = guaviare,
+          fill = NA,
+          color = "black",
+          linewidth = 0.3) +
+  
+  scale_color_manual(
+    values = c(
+      "High-High"        = "red",
+      "Low-Low"          = "blue",
+      "High-Low"         = "orange",
+      "Low-High"         = "lightblue",
+      "No significativo" = "grey80"
+    ),
+    name = "Cluster LISA"
+  ) +
+  
+    guides(
+    color = guide_legend(
+      override.aes = list(size = 2)  # aumenta este valor según necesites
+    )
+  ) +
+  
+  coord_sf(
+    xlim   = c(bbox$xmin, bbox$xmax),
+    ylim   = c(bbox$ymin, bbox$ymax),
+    expand = FALSE
+  ) +
+  
+  labs(
+    title    = "Clusters espaciales de deforestación",
+    subtitle = "Local Moran's I (LISA)",
+    x        = "Longitud",
+    y        = "Latitud"
+  ) +
+  
+  theme_minimal(base_size = 10) +
+  
+  theme(
+    panel.grid = element_blank(),
+    panel.ontop      = TRUE,
+    plot.title = element_text(face = "bold"),
+    legend.position  = c(0.85, 0.25) 
+  )
+
+ggsave(
+  filename = "D:/Edgar/Maestria/Semestre 3/Seminario II/Img/lisa_deforestacion.png",
+  width    = 7,
+  height   = 5,
+  dpi      = 600
+)
+
+```
+
+Este bloque evalúa cómo cambia la correlación de la deforestación a medida que aumenta la distancia entre las observaciones. Al utilizar un submuestreo aleatorio ($n=10,000$), optimizamos el tiempo de cómputo para calcular el índice de correlación en diferentes rezagos espaciales (incremementos de 10 km). La línea roja en cero indica ausencia de autocorrelación; valores por encima sugieren que el fenómeno tiende a agruparse espacialmente.
+
+```{r}
+
+
+set.seed(123)
+
+# tamaño razonable
+n_sample <- 10000  
+
+idx <- sample(1:nrow(coords), n_sample)
+
+coords_sub <- coords[idx, ]
+y_sub <- y[idx]
+
+library(ncf)
+
+correlog <- correlog(
+  x = coords_sub[,1],
+  y = coords_sub[,2],
+  z = y_sub,
+  increment = 10000, #10000
+  resamp = 50
+)
+
+plot(correlog$mean.of.class, correlog$correlation,
+     type = "b", pch = 16,
+     xlab = "Distancia (m)",
+     ylab = "Correlación",
+     main = "Correlograma (submuestreo)")
+
+abline(h = 0, col = "red", lty = 2)
+
+```
+
+La Función F mide la distribución de distancias desde puntos arbitrarios en el espacio hasta el evento de deforestación más cercano. Se utiliza un Convex Hull para definir el área de estudio y se invierte la orientación de los vértices para cumplir con los requisitos de la librería spatstat. Si la curva observada está por debajo de la teórica (CSR), indica un patrón agrupado.
+
+```{r}
+
+# Coordenadas
+dataFR <- data_sf
+coords_all <- st_coordinates(dataFR)
+coords_def <- st_coordinates(dataFR[dataFR$Deforestac == 1, ])
+
+# Convex hull
+hull_idx <- chull(coords_all[,1], coords_all[,2])
+hull_idx <- c(hull_idx, hull_idx[1])
+
+coords_hull <- coords_all[hull_idx, ]
+
+# 🔥 invertir orden (SOLUCIÓN)
+coords_hull <- coords_hull[nrow(coords_hull):1, ]
+
+# Ventana
+win <- owin(poly = list(x = coords_hull[,1],
+                        y = coords_hull[,2]))
+
+# Patrón
+pp <- ppp(coords_def[,1], coords_def[,2], window = win)
+
+# Función F + envolvente
+env_F <- envelope(pp, Fest, nsim = 99, correction = "border", rmax = 50000)
+
+```
+
+```{r}
+# Extraer datos del envelope
+df_F <- as.data.frame(env_F)
+
+p_F <- ggplot(df_F, aes(x = r)) +
+  
+  # Un solo ribbon con fill en aes para que aparezca en leyenda
+  geom_ribbon(aes(ymin = lo, ymax = hi, fill = "Envolvente MC"),
+              alpha = 0.4) +
+  
+  geom_line(aes(y = theo, color = "Esperado (CSR)"),
+            linetype = "dashed",
+            linewidth = 0.7) +
+  
+  geom_line(aes(y = obs, color = "Observado"),
+            linewidth = 0.9) +
+  
+  scale_fill_manual(
+    name   = "",
+    values = c("Envolvente MC" = "grey70")
+  ) +
+  
+  scale_color_manual(
+    name   = "",
+    values = c(
+      "Observado"      = "#B30000",
+      "Esperado (CSR)" = "black"
+    )
+  ) +
+  
+  guides(
+    color = guide_legend(override.aes = list(
+      linetype  = c("dashed", "solid"),
+      linewidth = c(0.7, 0.9)
+    )),
+    fill = guide_legend()
+  ) +
+  
+  labs(
+    title    = "Función F - Patrón espacial de deforestación",
+    subtitle = "Envolvente de simulación Monte Carlo (99 simulaciones)",
+    x        = "Distancia r (m)",
+    y        = "F(r)"
+  ) +
+  
+  theme_minimal(base_size = 10) +
+  
+  theme(
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+    panel.grid.minor = element_line(color = "grey95", linewidth = 0.2),
+    plot.title      = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+print(p_F)
+
+ggsave(
+  filename = "D:/Edgar/Maestria/Semestre 3/Seminario II/Img/funcion_F_deforestacion.png",
+  plot     = p_F,
+  width    = 7,
+  height   = 5,
+  dpi      = 600
+)
+```
+
+A diferencia de la Función F, la Función G analiza las distancias entre los propios eventos de deforestación. Es una medida directa de la intensidad del agrupamiento. La envolvente de Monte Carlo permite determinar si la cercanía entre focos de deforestación es significativamente mayor a la que se esperaría por puro azar (Complete Spatial Randomness - CSR).
+
+```{r}
+
+# 1. Calcular la Función G con corrección de borde
+G <- Gest(pp, correction = "border")
+
+# 2. Graficar la Función G comparada con el modelo teórico (CSR)
+plot(G, main = "Función G de Ripley",
+     xlab = "Distancia (m)", 
+     ylab = "G(r)")
+
+# 3. Opcional: Calcular sobres de confianza (Simulaciones de Monte Carlo)
+# Esto genera una zona gris de "lo que sería normal por azar"
+G_env <- envelope(pp, Gest, nsim = 99, correction = "border", rmax = 15000)
+
+# Extraer datos
+df_G <- as.data.frame(G_env)
+
+p_G <- ggplot(df_G, aes(x = r)) +
+  
+  geom_ribbon(aes(ymin = lo, ymax = hi, fill = "Envolvente MC"),
+              alpha = 0.4) +
+  
+  geom_line(aes(y = theo, color = "Esperado (CSR)"),
+            linetype  = "dashed",
+            linewidth = 0.7) +
+  
+  geom_line(aes(y = obs, color = "Observado"),
+            linewidth = 0.9) +
+  
+  scale_fill_manual(
+    name   = "",
+    values = c("Envolvente MC" = "grey70")
+  ) +
+  
+  scale_color_manual(
+    name   = "",
+    values = c(
+      "Observado"      = "#B30000",
+      "Esperado (CSR)" = "black"
+    )
+  ) +
+  
+  guides(
+    color = guide_legend(override.aes = list(
+      linetype  = c("dashed", "solid"),
+      linewidth = c(0.7, 0.9)
+    )),
+    fill = guide_legend()
+  ) +
+  
+  labs(
+    title    = "Función G - Patrón espacial de deforestación",
+    subtitle = "Distancia al vecino más cercano  |  Envolvente Monte Carlo (99 simulaciones)",
+    x        = "Distancia r (m)",
+    y        = "G(r)"
+  ) +
+  
+  theme_minimal(base_size = 10) +
+  
+  theme(
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+    panel.grid.minor = element_line(color = "grey95", linewidth = 0.2),
+    plot.title       = element_text(face = "bold"),
+    legend.position  = "bottom"
+  )
+
+print(p_G)
+
+ggsave(
+  filename = "D:/Edgar/Maestria/Semestre 3/Seminario II/Img/funcion_G_deforestacion.png",
+  plot     = p_G,
+  width    = 7,
+  height   = 5,
+  dpi      = 600
+)
+
+```
+
+La Función L es una transformación de la Función K de Ripley que facilita la interpretación visual. Al graficar $L(r) - r$, el valor esperado bajo aleatoriedad es cero (línea horizontal). Valores positivos por encima de la envolvente de confianza confirman un patrón de agrupamiento (clustering) a escalas de hasta 50 km, lo cual es típico en procesos de expansión de la frontera agrícola.
+
+```{r}
+
+dataFR <- data_sf
+coords_all <- st_coordinates(dataFR)
+coords_def <- st_coordinates(dataFR[dataFR$Deforestac == 1, ])
+
+# =========================
+# 2. Ventana con convex hull
+# =========================
+hull_idx <- chull(coords_all[,1], coords_all[,2])
+hull_idx <- c(hull_idx, hull_idx[1])
+
+coords_hull <- coords_all[hull_idx, ]
+
+# invertir orientación
+coords_hull <- coords_hull[nrow(coords_hull):1, ]
+
+win <- owin(poly = list(x = coords_hull[,1],
+                        y = coords_hull[,2]))
+
+# =========================
+# 3. Patrón de puntos
+# =========================
+pp <- ppp(coords_def[,1], coords_def[,2], window = win)
+
+# =========================
+# 4. Función L + envolvente
+# =========================
+env_L <- envelope(pp, Lest, nsim = 30, correction = "border", rmax = 50000)
+
+# Extraer datos
+df_L <- as.data.frame(env_L)
+
+# Transformar a L(r) - r
+df_L$obs_r  <- df_L$obs  - df_L$r
+df_L$theo_r <- df_L$theo - df_L$r
+df_L$lo_r   <- df_L$lo   - df_L$r
+df_L$hi_r   <- df_L$hi   - df_L$r
+
+p_L <- ggplot(df_L, aes(x = r)) +
+  
+  geom_ribbon(aes(ymin = lo_r, ymax = hi_r, fill = "Envolvente MC"),
+              alpha = 0.4) +
+  
+  geom_hline(yintercept = 0,
+             color    = "black",
+             linetype = "dashed",
+             linewidth = 0.6) +
+  
+  geom_line(aes(y = theo_r, color = "Esperado (CSR)"),
+            linetype  = "dashed",
+            linewidth = 0.7) +
+  
+  geom_line(aes(y = obs_r, color = "Observado"),
+            linewidth = 0.9) +
+  
+  scale_fill_manual(
+    name   = "",
+    values = c("Envolvente MC" = "grey70")
+  ) +
+  
+  scale_color_manual(
+    name   = "",
+    values = c(
+      "Observado"      = "#B30000",
+      "Esperado (CSR)" = "black"
+    )
+  ) +
+  
+  guides(
+    color = guide_legend(override.aes = list(
+      linetype  = c("dashed", "solid"),
+      linewidth = c(0.7, 0.9)
+    )),
+    fill = guide_legend()
+  ) +
+  
+  labs(
+    title    = "Función L de Ripley - Patrón espacial de deforestación",
+    subtitle = "L(r) - r  |  Envolvente Monte Carlo (30 simulaciones)",
+    x        = "Distancia r (m)",
+    y        = "L(r) - r"
+  ) +
+  
+  theme_minimal(base_size = 10) +
+  
+  theme(
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+    panel.grid.minor = element_line(color = "grey95", linewidth = 0.2),
+    plot.title       = element_text(face = "bold"),
+    legend.position  = "bottom"
+  )
+
+print(p_L)
+
+ggsave(
+  filename = "D:/Edgar/Maestria/Semestre 3/Seminario II/Img/funcion_L_deforestacion.png",
+  plot     = p_L,
+  width    = 7,
+  height   = 5,
+  dpi      = 600
+)
+```
+
+# 3. Modelado de la susceptibilidad mediante LR
+
+Primero se definen una seria de funciones que nos seran de ayuda para el entrenamiento del modelo de regresión Logistica.
+
+```{r}
+
+# ── 1. SPLIT ESTRATIFICADO ────────────────────────────────────────────────────
+split_datos <- function(X, y, test_size = 0.2, random_state = 42) {
+  set.seed(random_state)
+
+  idx_train <- caret::createDataPartition(
+    y,
+    p    = 1 - test_size,
+    list = FALSE
+  )
+
+  list(
+    X_train = X[ idx_train, ],
+    X_test  = X[-idx_train, ],
+    y_train = y[ idx_train],
+    y_test  = y[-idx_train]
+  )
+}
+
+# ── 2. ESCALADO (StandardScaler) ──────────────────────────────────────────────
+escalar_datos <- function(X_train, X_test) {
+  # Calcular media y sd SOLO en train (equivalente a fit_transform / transform)
+  medias <- colMeans(X_train)
+  desv   <- apply(X_train, 2, sd)
+
+  scaler <- list(mean = medias, sd = desv)   # guardar para invertir si necesitas
+
+  X_train_scaled <- as.data.frame(
+    scale(X_train, center = medias, scale = desv)
+  )
+  X_test_scaled  <- as.data.frame(
+    scale(X_test,  center = medias, scale = desv)
+  )
+
+  list(
+    X_train_scaled = X_train_scaled,
+    X_test_scaled  = X_test_scaled,
+    scaler         = scaler
+  )
+}
+
+# ── 3. TRANSFORMACIÓN LOG1P ───────────────────────────────────────────────────
+transformar_log <- function(X, vars_log) {
+  X_log <- X
+  for (v in vars_log) {
+    X_log[[v]] <- log1p(X_log[[v]])   # log(1 + x), igual que numpy.log1p
+  }
+  X_log
+}
+
+# ── 4. ENTRENAR REGRESIÓN LOGÍSTICA ──────────────────────────────────────────
+entrenar_lr <- function(X_train, y_train) {
+  df_train          <- X_train
+  df_train$.target  <- y_train
+
+  glm(
+    .target ~ .,
+    data   = df_train,
+    family = binomial(link = "logit"),
+    control = glm.control(
+      maxit   = 35,      
+      epsilon = 1e-8    
+    )
+  )
+}
+
+# ── 5. PREDECIR ───────────────────────────────────────────────────────────────
+predecir <- function(model, X_test, umbral = 0.5) {
+  y_prob <- predict(model, newdata = X_test, type = "response")
+  y_pred <- as.integer(y_prob >= umbral)
+
+  list(y_pred = y_pred, y_prob = y_prob)
+}
+
+# ── 6. EVALUAR ────────────────────────────────────────────────────────────────
+evaluar <- function(y_true, y_pred, y_prob) {
+  cm <- table(Real = y_true, Predicho = y_pred)
+
+  tp <- cm["1", "1"]
+  fp <- cm["0", "1"]
+  fn <- cm["1", "0"]
+
+  precision  <- tp / (tp + fp)
+  recall     <- tp / (tp + fn)
+
+  list(
+    Accuracy = mean(y_true == y_pred),
+    Recall   = recall,
+    F1       = 2 * precision * recall / (precision + recall),
+    AUC      = as.numeric(pROC::auc(pROC::roc(y_true, y_prob, quiet = TRUE)))
+  )
+}
+
+# ── 7. PLOT ROC ───────────────────────────────────────────────────────────────
+plot_roc <- function(y_true, y_prob) {
+  roc_obj <- pROC::roc(y_true, y_prob, quiet = TRUE)
+  auc_val <- round(as.numeric(pROC::auc(roc_obj)), 3)
+
+  pROC::plot.roc(
+    roc_obj,
+    col         = "steelblue",
+    lwd         = 2,
+    legacy.axes = TRUE,                          # eje X = FPR (como sklearn)
+    main        = "Curva ROC",
+    xlab        = "False Positive Rate",
+    ylab        = "True Positive Rate"
+  )
+
+  abline(a = 0, b = 1, lty = 2, col = "gray")   # línea aleatoria
+
+  legend("bottomright",
+         legend = paste("AUC =", auc_val),
+         col    = "steelblue",
+         lwd    = 2)
+}
+
+```
+
+Se extraen las variables del objeto espacial y se realiza la partición 80/20. Es fundamental visualizar la distribución de estos puntos en el mapa del Guaviare para confirmar que la muestra de entrenamiento y prueba cubra adecuadamente la variabilidad territorial del departamento.
+
+```{r}
+
+
+# Quitar geometría antes de todo
+df <- sf::st_drop_geometry(data_sf)
+
+variables <- c(
+  "DisZa_Medi", "Dis_Ap", "Aspect", "Prec_Media", "slope", "DistDre",
+  "DistVias", "DensPobl", "DisRios", "Dis_CP", "DEM"
+)
+
+X <- df[, variables]
+y <- df[["Deforestac"]]
+
+# =========================
+# 1. SPLIT (sin escalar)
+# =========================
+split <- split_datos(X, y)
+
+X_train_LR <- split$X_train
+X_test_LR  <- split$X_test
+y_train_LR <- split$y_train
+y_test_LR  <- split$y_test
+
+
+```
+
+Grafico de la partición test, train
+
+```{r}
+library(ggplot2)
+library(sf)
+
+# Recuperamos los índices originales usando los rownames del split
+idx_train <- as.numeric(rownames(X_train_LR))
+
+# Creamos una copia de los datos espaciales originales y asignamos el grupo
+data_plot <- data_sf
+data_plot$Set <- "Test"
+data_plot$Set[idx_train] <- "Train"
+
+# Obtenemos el Bounding Box para el recorte del mapa
+bbox <- st_bbox(guaviare)
+
+p_split <- ggplot() +
+  # 1. Capa base: El polígono del Guaviare
+  geom_sf(data = guaviare, 
+          fill = "grey95", 
+          color = "black", 
+          linewidth = 0.3) +
+  
+  # 2. Capa de puntos: Diferenciando Train y Test
+  geom_sf(data = data_plot, 
+          aes(color = Set), 
+          alpha = 0.6, 
+          size = 0.8) +
+  
+  # 3. Estética de colores (puedes ajustarlos a tu gusto)
+  scale_color_manual(
+    values = c("Train" = "#2C7BB6", "Test" = "#D7191C"),
+    name = "Partición"
+  ) +
+  
+  # 4. Ajuste de coordenadas (tu lógica de bbox)
+  coord_sf(
+    xlim = c(bbox$xmin, bbox$xmax),
+    ylim = c(bbox$ymin, bbox$ymax),
+    expand = FALSE
+  ) +
+  
+  # 5. Etiquetas y Títulos
+  labs(
+    title = "Distribución Espacial: Train vs Test",
+    subtitle = paste0("Total: ", nrow(data_plot), " puntos (80/20 split)"),
+    x = "Longitud",
+    y = "Latitud"
+  ) +
+  
+    guides(
+    color = guide_legend(
+      override.aes = list(size = 2)  # aumenta este valor según necesites
+    )
+  ) +
+  
+  # 6. Tu tema personalizado
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold"),
+    legend.position = "bottom",
+    #panel.background = element_rect(fill = "aliceblue") # Para simular agua/entorno
+  )
+
+# Visualizar
+print(p_split)
+
+# Guardar
+ggsave(
+  filename = "D:/Edgar/Maestria/Semestre 3/Seminario II/Img/split_train_test_LR.png",
+  plot     = p_split,
+  width    = 7,
+  height   = 6,
+  dpi      = 600
+)
+```
+
+En este bloque se aplican las transformaciones finales: logaritmo para suavizar sesgos en distancias y escalado para que todos los predictores tengan el mismo peso inicial en el algoritmo. Se genera la curva ROC para cuantificar el desempeño del modelo.
+
+```{r}
+
+# 1. Transformación
+vars_log <- c("DisZa_Medi", "DistVias", "DistDre", "Dis_CP")
+X_log <- transformar_log(X, vars_log)
+
+# 2. Usar mismos índices del split
+X_train_log <- X_log[rownames(X_train_LR), ]
+X_test_log  <- X_log[rownames(X_test_LR),  ]
+
+# 3. Escalar
+scaled_log <- escalar_datos(X_train_log, X_test_log)
+
+X_train_log_scaled <- scaled_log$X_train_scaled
+X_test_log_scaled  <- scaled_log$X_test_scaled
+scaler_log         <- scaled_log$scaler
+
+# 4. Entrenar
+MLR_log <- entrenar_lr(X_train_log_scaled, y_train_LR)
+
+# 5. Predecir
+preds_log  <- predecir(MLR_log, X_test_log_scaled)
+y_pred_log <- preds_log$y_pred
+y_prob_log <- preds_log$y_prob
+
+# 6. Evaluar
+res_log <- evaluar(y_test_LR, y_pred_log, y_prob_log)
+
+plot_roc(y_test_LR, y_prob_log)
+
+print(res_log)
+
+summary(MLR_log)
+```
+
+Este proceso traslada los coeficientes estadísticos obtenidos a un entorno geográfico. Se cargan las capas ráster, se alinean mediante resampling y se procesan exactamente con la misma lógica que los datos de entrenamiento (Logaritmo + Escalado con media y SD de train). El mapa final se calcula mediante la función logística inversa.
+
+```{r}
+
+files <- list.files("D:/Tesis Maestria/VariablesProyecto/Raster",
+                    full.names = TRUE)
+
+vars <- c("Aspect","DEM","DensidadPoblacional","Dis_Ap","Dis_CP",
+          "DisRios","DistanciaDrenajes","DistanciaVias",
+          "DisZa_Media","Prec_Media", "slope")
+
+files_clean <- files[
+  grepl("\\.tif$", files) &
+  sapply(vars, function(v) grepl(v, files)) |> rowSums() > 0
+]
+
+# =========================================
+# 1. CARGA DE RASTERS Y ALINEACIÓN
+# =========================================
+
+raster_list <- lapply(files_clean, rast)
+names(raster_list) <- tools::file_path_sans_ext(basename(files_clean))
+
+for (i in seq_along(raster_list)) {
+  names(raster_list[[i]]) <- names(raster_list)[i]
+}
+
+maestro <- raster_list[[1]]
+
+for (i in 1:length(raster_list)) {
+  if (!compareGeom(raster_list[[i]], maestro, stopOnError = FALSE)) {
+    raster_list[[i]] <- resample(raster_list[[i]], maestro, method = "near")
+  }
+}
+
+vars_log <- c("DisZa_Media", "DistanciaVias", "DistanciaDrenajes", "Dis_CP")
+
+for (v in vars_log) {
+  if (v %in% names(raster_list)) {
+    raster_list[[v]] <- log1p(raster_list[[v]])
+  }
+}
+
+mapeo_escala <- c(
+  "DisZa_Media" = "DisZa_Medi",
+  "DistanciaVias" = "DistVias",
+  "DistanciaDrenajes" = "DistDre",
+  "Dis_CP" = "Dis_CP",
+  "Prec_Media" = "Prec_Media",
+  "DEM" = "DEM",
+  "slope" = "slope",
+  "Aspect" = "Aspect",
+  "DensidadPoblacional" = "DensPobl",
+  "DisRios" = "DisRios",
+  "Dis_Ap" = "Dis_Ap"
+)
+
+for (v in names(raster_list)) {
+  if (v %in% names(mapeo_escala)) {
+    var_modelo <- mapeo_escala[[v]]
+    m <- scaler_log[["mean"]][var_modelo]
+    s <- scaler_log[["sd"]][var_modelo]
+
+    
+    cat("Variable raster  :", v, "\n")
+    cat("Variable modelo  :", var_modelo, "\n")
+    cat("Media            :", m, "\n")
+    cat("SD               :", s, "\n\n")
+    
+    raster_list[[v]] <- (raster_list[[v]] - m) / s
+    
+  }
+}
+
+coeficients <- MLR_log$coefficients
+
+# =========================================
+# 4. ÁLGEBRA DE MAPAS (IGUAL)
+# =========================================
+
+logit <- coeficients[["(Intercept)"]] +
+  (raster_list[["DisZa_Media"]] * coeficients[["DisZa_Medi"]]) +
+  (raster_list[["DistanciaVias"]] * coeficients[["DistVias"]]) +
+  (raster_list[["DistanciaDrenajes"]] * coeficients[["DistDre"]]) +
+  (raster_list[["Dis_CP"]] * coeficients[["Dis_CP"]]) +
+  (raster_list[["Prec_Media"]] * coeficients[["Prec_Media"]]) +
+  (raster_list[["DEM"]] * coeficients[["DEM"]]) +
+  (raster_list[["slope"]] * coeficients[["slope"]]) +
+  (raster_list[["Aspect"]] * coeficients[["Aspect"]]) +
+  (raster_list[["DensidadPoblacional"]] * coeficients[["DensPobl"]]) +
+  (raster_list[["DisRios"]] * coeficients[["DisRios"]]) +
+  (raster_list[["Dis_Ap"]] * coeficients[["Dis_Ap"]])
+
+# =========================================
+# 5. PROBABILIDAD
+# =========================================
+
+susceptibilidad <- 1 / (1 + exp(-logit))
+
+cat("✓ Mapa de susceptibilidad generado\n")
+
+# =========================================
+# 6. EXPORTAR
+# =========================================
+
+
+# 2. Definición WKT robusta para EPSG:9377 (Origen Nacional)
+# Esta cadena contiene toda la información técnica para que cualquier GIS lo ubique
+crs_bol_wkt <- 'PROJCS["MAGNA-SIRGAS / Origen-Nacional",
+    GEOGCS["MAGNA-SIRGAS",
+        DATUM["Marco_Geocentrico_Nacional_de_Referencia",
+            SPHEROID["GRS 1980",6378137,298.257222101]],
+        PRIMEM["Greenwich",0],
+        UNIT["degree",0.0174532925199433]],
+    PROJECTION["Transverse_Mercator"],
+    PARAMETER["latitude_of_origin",4],
+    PARAMETER["central_meridian",-73],
+    PARAMETER["scale_factor",1],
+    PARAMETER["false_easting",5000000],
+    PARAMETER["false_northing",2000000],
+    UNIT["metre",1],
+    AUTHORITY["EPSG","9377"]]'
+
+# 3. Inyectar el CRS y la Extensión manualmente
+set.crs(susceptibilidad, crs_bol_wkt)
+
+# Usamos los límites exactos que reportó tu capa de puntos (DATASET.shp)
+# Redondeamos ligeramente para asegurar cobertura total del Guaviare
+ext(susceptibilidad) <- ext(maestro)
+
+# Guardar resultado final
+
+writeRaster(susceptibilidad, "D:/Tesis Maestria/VariablesProyecto/Raster/SUS_LR.tif", overwrite=TRUE)
+
+```
+
+# 4. Modelado de la susceptibilidad mediante INLA
+
+Para el modelado espacial, el primer paso fundamental es separar la componente geográfica de la base de datos. Se extraen las coordenadas proyectadas (X, Y) de cada punto de observación, las cuales servirán como anclaje para la construcción de la malla de triangulación (mesh) y el cálculo de las funciones de covarianza de Matérn.
+
+```{r}
+coords <- st_coordinates(data_sf)
+```
+
+Se asegura que la variable objetivo Deforestac sea tratada como un vector de enteros ($0$ y $1$). En el marco de INLA, esto define la distribución de la familia de datos como Binomial (o Bernoulli), donde el modelo intentará predecir la probabilidad de ocurrencia del evento de deforestación en función de los predictores y el efecto espacial.
+
+```{r}
+# 4. Variable respuesta binaria
+data_sf$y <- as.integer(data_sf$Deforestac)
+```
+
+En esta etapa se realiza la limpieza final del dataset, eliminando variables que presentan redundancia o que no serán incluidas en la estructura final del modelo (como Temp_Media). Este proceso es crítico para reducir la complejidad computacional y evitar problemas de colinealidad en la estimación de los hiperparámetros del modelo bayesiano.
+
+```{r}
+# EJEMPLO: eliminamos Prec_Media
+data_sf$Temp_Media <- NULL
+```
+
+Dado que las variables de distancia (a vías, ríos o centros poblados) suelen presentar distribuciones con un fuerte sesgo a la derecha, se aplica la transformación logarítmica log1p ($y = \log(1+x)$). Esta transformación estabiliza la varianza y permite que el modelo capture relaciones de decaimiento espacial de forma más lineal, mejorando la convergencia del algoritmo de aproximación de Laplace.
+
+```{r}
+vars_log <- c("DisZa_Medi", "DistVias", "DistDre", "Dis_CP")
+
+for (v in vars_log) {
+  data_sf[[v]] <- log1p(data_sf[[v]])
+}
+```
+
+Para asegurar la convergencia de los algoritmos bayesianos, se realiza un escalado manual de las variables predictoras. A diferencia de un escalado genérico, aquí se calculan y almacenan la media y la desviación estándar de cada variable. Este paso es fundamental para poder aplicar exactamente la misma transformación a las capas ráster durante la fase de predicción espacial, garantizando la coherencia entre los datos de entrenamiento y el mapa final.
+
+```{r}
+params_escala <- list()
+
+cols_scale <- c("DisZa_Medi","DistVias","DistDre","Dis_CP",
+                "Prec_Media","DEM","slope","Aspect","DensPobl","DisRios", "Dis_Ap")
+
+for (v in cols_scale) {
+  if (v %in% names(data_sf)) {
+    # 1. Calculamos y guardamos la media y SD de los puntos
+    m_entrenamiento <- mean(data_sf[[v]], na.rm = TRUE)
+    s_entrenamiento <- sd(data_sf[[v]], na.rm = TRUE)
+    
+    params_escala[[v]] <- c(mean = m_entrenamiento, sd = s_entrenamiento)
+    
+    # 2. Escalamos manualmente los puntos usando esos valores
+    data_sf[[v]] <- (data_sf[[v]] - m_entrenamiento) / s_entrenamiento
+  }
+}
+```
+
+Se genera una malla bidimensional (Constrained Delaunay Triangulation) que discretiza el área de estudio. Se definen parámetros de resolución interna (max.edge) y una zona de amortiguamiento (offset) para minimizar los efectos de borde. El parámetro cutoff se establece para evitar una densidad excesiva de nodos en zonas con alta concentración de puntos, optimizando el costo computacional del modelo.
+
+```{r}
+mesh <- inla.mesh.2d(
+  loc = coords,
+  max.edge = c(4000, 16000),
+  cutoff   = 1800,
+  offset   = c(10000, 30000)
+)
+```
+
+Se implementa el enfoque de Ecuaciones Diferenciales Parciales Estocásticas (SPDE) para representar el campo aleatorio continuo. Se utilizan Priores Penalizados por Complejidad (PC Priors) para el rango espacial y la varianza (sigma). El prior.range define la distancia a la cual la correlación espacial decae significativamente, permitiendo al modelo capturar de manera objetiva la dependencia geográfica de la deforestación.
+
+```{r}
+spde <- inla.spde2.pcmatern(
+  mesh = mesh,
+  alpha = 2,
+  prior.range = c(60000, 0.5),  # 🔥 20 km
+  prior.sigma = c(3, 0.1)
+)
+```
+
+Se genera un índice que vincula los nodos de la malla con la estructura del SPDE. Este índice permite a INLA organizar las contribuciones del efecto aleatorio espacial para cada localización, facilitando la integración de la componente geográfica en el predictor lineal.
+
+```{r}
+spde_index <- inla.spde.make.index(
+  name = "spatial",
+  n.spde = spde$n.spde
+)
+```
+
+Para una validación robusta en modelos espaciales, se utiliza un split por bloques en lugar de un muestreo aleatorio simple. Dado que los datos espaciales presentan autocorrelación, un split aleatorio tradicional sobreestimaría la precisión del modelo. Al dividir el territorio en bloques de $10 \times 10$ km y asignar bloques completos al conjunto de entrenamiento (80%) o prueba (20%), se garantiza que el modelo sea evaluado por su capacidad de generalizar a nuevas áreas geográficas no observadas.
+
+Se genera un mapa diagnóstico para verificar la distribución geográfica de los conjuntos de datos. Esta visualización permite confirmar que tanto los datos de entrenamiento como los de prueba mantienen una representatividad espacial equilibrada sobre el departamento del Guaviare, evitando sesgos regionales en la evaluación del desempeño del modelo.
+
+```{r}
+vars <- c("DisZa_Medi","DistVias","DistDre","Dis_CP",
+          "Prec_Media","DEM","slope","Aspect","DensPobl","DisRios", "Dis_Ap")
+
+# Datos fijos (covariables)
+X_df <- as.data.frame(st_drop_geometry(data_sf))[, c("y", vars)]
+
+
+
+# Separar respuesta
+y <- X_df$y
+
+# Crear X SOLO con covariables
+X_df <- X_df[, vars]
+
+
+X_df$beta0 <- 1
+```
+
+```{r}
+# ─────────────────────────────
+# 1. BLOQUES ESPACIALES
+# ─────────────────────────────
+block_size <- 10000
+
+block_x  <- floor(coords[,1] / block_size)
+block_y  <- floor(coords[,2] / block_size)
+block_id <- paste(block_x, block_y, sep = "_")
+
+set.seed(123)
+bloques      <- unique(block_id)
+train_blocks <- sample(bloques, size = 0.8 * length(bloques))
+train_idx    <- which(block_id %in% train_blocks)
+test_idx     <- which(!block_id %in% train_blocks)
+
+X_train      <- X_df[train_idx, ]
+y_train      <- y[train_idx]
+coords_train <- coords[train_idx, ]
+
+X_test       <- X_df[test_idx, ]
+y_test       <- y[test_idx]
+coords_test  <- coords[test_idx, ]
+
+# ─────────────────────────────
+# 2. PREPARAR DATA PARA GGPLOT
+# ─────────────────────────────
+data_plot <- rbind(
+  st_as_sf(data.frame(coords_train, Set = "Train"),
+           coords = c("X", "Y"), crs = st_crs(data_sf)),
+  st_as_sf(data.frame(coords_test,  Set = "Test"),
+           coords = c("X", "Y"), crs = st_crs(data_sf))
+)
+
+# ─────────────────────────────
+# 3. PLOT
+# ─────────────────────────────
+bbox <- st_bbox(guaviare)
+
+p_split <- ggplot() +
+
+  geom_sf(data = guaviare,
+          fill      = "grey95",
+          color     = "black",
+          linewidth = 0.3) +
+
+  geom_sf(data = data_plot,
+          aes(color = Set),
+          alpha = 0.6,
+          size  = 0.8) +
+
+  scale_color_manual(
+    values = c("Train" = "#2C7BB6", "Test" = "#D7191C"),
+    name   = "Partición"
+  ) +
+
+  coord_sf(
+    xlim   = c(bbox$xmin, bbox$xmax),
+    ylim   = c(bbox$ymin, bbox$ymax),
+    expand = FALSE
+  ) +
+
+  labs(
+    title    = "Distribución espacial: Train vs. Test",
+    subtitle = paste0("Total: ", nrow(data_plot), " puntos (80/20 split)"),
+    x = "Longitud",
+    y = "Latitud"
+  ) +
+
+  guides(
+    color = guide_legend(
+      override.aes = list(size = 3)
+    )
+  ) +
+
+  theme_minimal(base_size = 10) +
+
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+print(p_split)
+
+ggsave(
+  filename = "D:/Edgar/Maestria/Semestre 3/Seminario II/Img/split_train_test_inla.png",
+  plot     = p_split,
+  width    = 7,
+  height   = 6,
+  dpi      = 600
+)
+```
+
+Se generan las matrices de proyección A para los conjuntos de entrenamiento y prueba. Estas matrices actúan como un puente, mapeando el campo aleatorio continuo definido en los nodos de la malla hacia las ubicaciones puntuales de la muestra. Posteriormente, se organizan en objetos inla.stack, lo cual permite manejar de forma independiente los efectos espaciales (SPDE) y los efectos fijos (covariables), asignando etiquetas específicas (train y test) para facilitar la posterior extracción de resultados.
+
+```{r}
+A_train <- inla.spde.make.A(mesh = mesh, loc = coords_train)
+ 
+stack_train <- inla.stack(
+  data = list(y = y_train),
+  A = list(A_train, 1),
+  effects = list(
+    spde_index,
+    X_train
+  ),
+  tag = "train"
+ )
+
+```
+
+```{r}
+A_test <- inla.spde.make.A(mesh = mesh, loc = coords_test)
+
+stack_test <- inla.stack(
+  data = list(y = NA),
+  A = list(A_test, 1),
+  effects = list(
+    spde_index,
+    X_test
+  ),
+  tag = "test"
+)
+```
+
+Se combinan los stacks de entrenamiento y prueba en un único objeto stack_full. En el stack de prueba, la variable respuesta se define como NA, lo que indica a INLA que debe realizar una predicción (inferencia) sobre esos puntos basándose en los coeficientes estimados en el conjunto de entrenamiento y la correlación espacial compartida.
+
+```{r}
+stack_full <- inla.stack(stack_train, stack_test)
+```
+
+Se especifica la estructura del modelo jerárquico. Se incluye un intercepto explícito (beta0) y el conjunto de covariables estandarizadas. El término crucial es f(spatial, model = spde), que incorpora el campo aleatorio espacial. Esta formulación asume que la probabilidad de deforestación es una función de los factores antrópicos y ambientales, más una componente de error espacialmente estructurado que captura procesos no observados.
+
+```{r}
+formula <- y ~ -1 + beta0 +
+   DisZa_Medi + DistVias + DistDre + Dis_CP +
+   Prec_Media + DEM + slope + Aspect + DensPobl + DisRios + Dis_Ap +
+   f(spatial, model = spde)
+```
+
+Se ejecuta el motor de cálculo de INLA utilizando una distribución Binomial con función de enlace logit. Se configuran los controles de predicción para computar los valores ajustados en todos los puntos (incluyendo los NA de prueba). Además, se solicitan criterios de información como DIC (Deviance Information Criterion) y WAIC (Watanabe-Akaike Information Criterion), herramientas fundamentales para la comparación de modelos y la evaluación de la complejidad frente al ajuste.
+
+```{r}
+result <- inla(
+  formula,
+  family = "binomial",
+  data = inla.stack.data(stack_full),
+  control.predictor = list(
+    A = inla.stack.A(stack_full),
+    compute = TRUE,
+    link = 1
+    ),
+  control.compute = list(
+    dic = TRUE,
+    waic = TRUE,
+    cpo = TRUE
+    )
+)
+```
+
+Este bloque genera el resumen estadístico de las distribuciones posteriori de los parámetros. Se obtienen las medias, desviaciones estándar e intervalos de credibilidad para cada coeficiente. Un intervalo de credibilidad que no cruza el cero indica que la variable es estadísticamente significativa para explicar la deforestación en el Guaviare bajo este marco bayesiano.
+
+```{r}
+summary(result)
+```
+
+Una vez ajustado el modelo bayesiano, es imperativo validar su capacidad predictiva. En esta sección se comparan los resultados obtenidos en el conjunto de entrenamiento frente al de prueba, utilizando métricas que evalúan la discriminación del modelo entre áreas con y sin deforestación.
+
+```{r}
+# ── 1. ÍNDICES EN EL STACK ───────────────────────────────────────────────────
+index_train <- inla.stack.index(stack_full, tag = "train")$data
+index_test  <- inla.stack.index(stack_full, tag = "test")$data
+
+# ── 2. PREDICTOR LINEAL → PROBABILIDADES ────────────────────────────────────
+eta_train <- result$summary.linear.predictor$mean[index_train]
+eta_test  <- result$summary.linear.predictor$mean[index_test]
+
+prob_train <- 1 / (1 + exp(-eta_train))  # equivalente a 1/(1+exp(-x))
+prob_test  <- 1 / (1 + exp(-eta_test))
+
+# ── 3. CURVAS ROC ────────────────────────────────────────────────────────────
+roc_train <- pROC::roc(response  = y_train,
+                       predictor = prob_train,
+                       quiet     = TRUE)
+
+roc_test  <- pROC::roc(response  = y_test,
+                       predictor = prob_test,
+                       quiet     = TRUE)
+
+# ── 4. RESULTADOS NUMÉRICOS ──────────────────────────────────────────────────
+cat("── AUC ──────────────────────────────────\n")
+cat("AUC Train:", round(pROC::auc(roc_train), 4), "\n")
+cat("AUC Test :", round(pROC::auc(roc_test), 4), "\n")
+cat("Diferencia:", round(pROC::auc(roc_train) - pROC::auc(roc_test), 4),
+    "← idealmente < 0.05\n")
+
+# ── 5. PLOT AMBAS CURVAS ─────────────────────────────────────────────────────
+pROC::plot.roc(
+  roc_train,
+  col         = "blue",
+  lwd         = 2,
+  main        = "Curva ROC — Train vs Test",
+  legacy.axes = TRUE
+)
+
+pROC::plot.roc(          # <-- cambio aquí
+  roc_test,
+  col  = "red",
+  lwd  = 2,
+  add  = TRUE            # add = TRUE para superponer
+)
+
+legend("bottomright",
+       legend = c(paste("Train AUC =", round(pROC::auc(roc_train), 4)),
+                  paste("Test  AUC =", round(pROC::auc(roc_test),  4))),
+       col    = c("blue", "red"),
+       lwd    = 2)
+
+# ── 6. TEST ESTADÍSTICO DE DIFERENCIA ────────────────────────────────────────
+# Verifica si la diferencia train-test es significativa
+test_roc <- pROC::roc.test(roc_train, roc_test, method = "delong")
+cat("\n── Test DeLong (diferencia AUC) ─────────\n")
+cat("p-value:", round(test_roc$p.value, 4), "\n")
+cat("Interpretación:",
+    ifelse(test_roc$p.value < 0.05,
+           "⚠️ Diferencia significativa → posible sobreajuste",
+           "✅ Sin diferencia significativa → modelo generaliza bien"),
+    "\n")
+```
+
+En esta etapa final, se integra el conocimiento estadístico obtenido por el modelo INLA con la información geográfica continua (rasters). El proceso culmina en la creación de un mapa de susceptibilidad que combina variables ambientales, antrópicas y el componente de autocorrelación espacial residual.
+
+```{r}
+
+files <- list.files("D:/Tesis Maestria/VariablesProyecto/Raster",
+                    full.names = TRUE)
+
+vars <- c("Aspect","DEM","DensidadPoblacional","Dis_Ap","Dis_CP",
+          "DisRios","DistanciaDrenajes","DistanciaVias",
+          "DisZa_Media","Prec_Media", "slope")
+
+files_clean <- files[
+  grepl("\\.tif$", files) &
+  sapply(vars, function(v) grepl(v, files)) |> rowSums() > 0
+]
+```
+
+```{r}
+
+# =========================================
+# 1. CARGA DE RASTERS Y ALINEACIÓN
+# =========================================
+
+raster_list <- lapply(files_clean, rast)
+names(raster_list) <- tools::file_path_sans_ext(basename(files_clean))
+
+for (i in seq_along(raster_list)) {
+  names(raster_list[[i]]) <- names(raster_list)[i]
+}
+
+maestro <- raster_list[[1]]
+
+for (i in 1:length(raster_list)) {
+  if (!compareGeom(raster_list[[i]], maestro, stopOnError = FALSE)) {
+    raster_list[[i]] <- resample(raster_list[[i]], maestro, method = "near")
+  }
+}
+
+# =========================================
+# 2. TRANSFORMACIONES
+# =========================================
+
+vars_log <- c("DisZa_Media", "DistanciaVias", "DistanciaDrenajes", "Dis_CP")
+
+for (v in vars_log) {
+  if (v %in% names(raster_list)) {
+    raster_list[[v]] <- log1p(raster_list[[v]])
+  }
+}
+
+mapeo_escala <- c(
+  "DisZa_Media" = "DisZa_Medi",
+  "DistanciaVias" = "DistVias",
+  "DistanciaDrenajes" = "DistDre",
+  "Dis_CP" = "Dis_CP",
+  "Prec_Media" = "Prec_Media",
+  "DEM" = "DEM",
+  "slope" = "slope",
+  "Aspect" = "Aspect",
+  "DensidadPoblacional" = "DensPobl",
+  "DisRios" = "DisRios",
+  "Dis_Ap" = "Dis_Ap"
+)
+
+for (v in names(raster_list)) {
+  if (v %in% names(mapeo_escala)) {
+    var_modelo <- mapeo_escala[v]
+    if (var_modelo %in% names(params_escala)) {
+      m <- params_escala[[var_modelo]]["mean"]
+      s <- params_escala[[var_modelo]]["sd"]
+      raster_list[[v]] <- (raster_list[[v]] - m) / s
+    }
+  }
+}
+
+# ==============================================================================
+# PARTE 3: PROYECCIÓN DEL EFECTO ESPACIAL (PROCESAMIENTO POR BLOQUES)
+# ==============================================================================
+
+# 1. Preparación de objetos
+w_mean <- result$summary.random$spatial$mean 
+r_ref  <- maestro                            
+opt_file <- "D:/temp_terra/spatial_tempMf.tif"
+
+if(!dir.exists("D:/temp_terra/")) dir.create("D:/temp_terra/", recursive = TRUE)
+
+# Crear raster de salida vacío
+raster_espacial <- rast(r_ref)
+writeStart(raster_espacial, filename = opt_file, overwrite = TRUE)
+
+# Parámetros de la grilla
+ext_r <- ext(r_ref)
+res_r <- res(r_ref)
+n_cols <- ncol(r_ref)
+n_rows <- nrow(r_ref)
+
+block_size <- 500 
+
+cat("--- Iniciando Proyección Espacial por Bloques ---\n")
+
+for (i in seq(1, n_rows, by = block_size)) {
+  
+  nrows_block <- min(block_size, n_rows - i + 1)
+  
+  # ✅ LECTURA SEGURA: Extraer como matriz y forzar a vector
+  # Esto garantiza que el tamaño sea EXACTAMENTE nrows_block * n_cols
+  vals_block <- r_ref[i:(i + nrows_block - 1), ]
+  vals_vector <- as.vector(as.matrix(vals_block))
+  
+  # Identificar píxeles válidos dentro del bloque
+  valid_idx <- which(!is.na(vals_vector))
+  
+  # Preparar vector de salida del MISMO tamaño que el bloque de entrada
+  out_vals <- rep(NA_real_, length(vals_vector))
+  
+  if (length(valid_idx) > 0) {
+    
+    # 2. CÁLCULO MANUAL DE COORDENADAS
+    # Calculamos qué fila y columna global corresponde a cada píxel válido
+    # 'valid_idx' es la posición dentro del bloque plano
+    
+    # Fila local dentro del bloque (1 a nrows_block)
+    row_local <- ((valid_idx - 1) %/% n_cols) + 1
+    # Columna (1 a n_cols)
+    col_local <- ((valid_idx - 1) %% n_cols) + 1
+    
+    # Fila global en el raster completo
+    row_global <- row_local + i - 1
+    
+    # Conversión a coordenadas geográficas (Centros de píxel)
+    x_coords <- ext_r$xmin + (col_local - 0.5) * res_r[1]
+    y_coords <- ext_r$ymax - (row_global - 0.5) * res_r[2]
+    
+    coords_block <- cbind(x_coords, y_coords)
+    
+    # 3. Proyección del SPDE
+    A_block <- inla.spde.make.A(mesh = mesh, loc = coords_block)
+    w_block <- as.vector(A_block %*% w_mean)
+    
+    # Asignar resultados a las posiciones correspondientes
+    out_vals[valid_idx] <- w_block
+  }
+  
+  # 4. Escritura (El tamaño de out_vals ahora es perfecto)
+  writeValues(raster_espacial, out_vals, start = i, nrows = nrows_block)
+  
+  # Feedback de progreso
+  progreso <- round((i + nrows_block - 1) / n_rows * 100, 1)
+  cat(sprintf("✓ Filas %d - %d [%.1f%%] completado\n", 
+              i, i + nrows_block - 1, progreso))
+}
+
+raster_espacial <- writeStop(raster_espacial)
+cat("\n--- PROCESO FINALIZADO CON ÉXITO ---")
+
+
+
+# =========================================
+# 4. ÁLGEBRA DE MAPAS (IGUAL)
+# =========================================
+
+betas <- result$summary.fixed$mean
+names(betas) <- rownames(result$summary.fixed)
+
+b0 <- 0
+if ("beta0" %in% names(betas)) {
+  b0 <- betas["beta0"]
+}
+
+logit <- b0 +
+  (raster_list[["DisZa_Media"]] * betas["DisZa_Medi"]) +
+  (raster_list[["DistanciaVias"]] * betas["DistVias"]) +
+  (raster_list[["DistanciaDrenajes"]] * betas["DistDre"]) +
+  (raster_list[["Dis_CP"]] * betas["Dis_CP"]) +
+  (raster_list[["Prec_Media"]] * betas["Prec_Media"]) +
+  (raster_list[["DEM"]] * betas["DEM"]) +
+  (raster_list[["slope"]] * betas["slope"]) +
+  (raster_list[["Aspect"]] * betas["Aspect"]) +
+  (raster_list[["DensidadPoblacional"]] * betas["DensPobl"]) +
+  (raster_list[["DisRios"]] * betas["DisRios"]) +
+  (raster_list[["Dis_Ap"]] * betas["Dis_Ap"]) +
+  raster_espacial
+
+# =========================================
+# 5. PROBABILIDAD
+# =========================================
+
+susceptibilidad <- 1 / (1 + exp(-logit))
+
+cat("✓ Mapa de susceptibilidad generado\n")
+
+# =========================================
+# 6. EXPORTAR
+# =========================================
+
+# 2. Definición WKT robusta para EPSG:9377 (Origen Nacional)
+# Esta cadena contiene toda la información técnica para que cualquier GIS lo ubique
+crs_bol_wkt <- 'PROJCS["MAGNA-SIRGAS / Origen-Nacional",
+    GEOGCS["MAGNA-SIRGAS",
+        DATUM["Marco_Geocentrico_Nacional_de_Referencia",
+            SPHEROID["GRS 1980",6378137,298.257222101]],
+        PRIMEM["Greenwich",0],
+        UNIT["degree",0.0174532925199433]],
+    PROJECTION["Transverse_Mercator"],
+    PARAMETER["latitude_of_origin",4],
+    PARAMETER["central_meridian",-73],
+    PARAMETER["scale_factor",1],
+    PARAMETER["false_easting",5000000],
+    PARAMETER["false_northing",2000000],
+    UNIT["metre",1],
+    AUTHORITY["EPSG","9377"]]'
+
+# 3. Inyectar el CRS y la Extensión manualmente
+set.crs(susceptibilidad, crs_bol_wkt)
+
+# Usamos los límites exactos que reportó tu capa de puntos (DATASET.shp)
+# Redondeamos ligeramente para asegurar cobertura total del Guaviare
+ext(susceptibilidad) <- ext(maestro)
+
+# Guardar resultado final
+
+writeRaster(susceptibilidad, "D:/Tesis Maestria/VariablesProyecto/Raster/INLAMf.tif", overwrite=TRUE)
+
+
+```
+
+# 5. Análisis Comparativo
+
+En esta fase se realiza el contraste estadístico y espacial entre el modelo de Regresión Logística (LR) y el modelo Bayesiano con estructura espacial (INLA-SPDE). El objetivo es determinar la ganancia en precisión al incluir la componente de autocorrelación en el modelado de la deforestación.
+
+Se integran los resultados de ambos modelos en una visualización de Característica Operativa del Receptor (ROC). Este gráfico permite evaluar la capacidad de discriminación bajo el estándar de "artículo científico". El área bajo la curva (AUC) sirve como métrica global de desempeño: valores más altos indican que el modelo separa con mayor éxito las zonas deforestadas de las no deforestadas. La comparación visual de las curvas revela si la inclusión del efecto espacial en INLA mejora la sensibilidad o la especificidad del modelo.
+
+```{r}
+# ─────────────────────────────────────────────
+# LIBRERÍAS
+# ─────────────────────────────────────────────
+library(pROC)
+library(ggplot2)
+
+# ─────────────────────────────────────────────
+# 1. ÍNDICES DEL STACK (INLA)
+# ─────────────────────────────────────────────
+index_train <- inla.stack.index(stack_full, tag = "train")$data
+index_test  <- inla.stack.index(stack_full, tag = "test")$data
+
+# ─────────────────────────────────────────────
+# 2. PREDICTOR → PROBABILIDADES (INLA)
+# ─────────────────────────────────────────────
+eta_train <- result$summary.linear.predictor$mean[index_train]
+eta_test  <- result$summary.linear.predictor$mean[index_test]
+
+prob_train <- 1 / (1 + exp(-eta_train))
+prob_test  <- 1 / (1 + exp(-eta_test))
+
+# ─────────────────────────────────────────────
+# 4. CURVAS ROC
+# ─────────────────────────────────────────────
+roc_lr <- pROC::roc(
+  response  = y_test_LR,
+  predictor = y_prob_log,
+  quiet     = TRUE
+)
+
+roc_inla <- pROC::roc(
+  response  = y_test,
+  predictor = prob_test,
+  quiet     = TRUE
+)
+
+# ─────────────────────────────────────────────
+# 5. DATA PARA GGPLOT
+# ─────────────────────────────────────────────
+df_lr <- data.frame(
+  FPR = 1 - roc_lr$specificities,
+  TPR = roc_lr$sensitivities,
+  Modelo = "LR"
+)
+
+df_inla <- data.frame(
+  FPR = 1 - roc_inla$specificities,
+  TPR = roc_inla$sensitivities,
+  Modelo = "INLA"
+)
+
+df_plot <- rbind(df_lr, df_inla)
+
+# ─────────────────────────────────────────────
+# 6. AUC
+# ─────────────────────────────────────────────
+auc_lr   <- round(pROC::auc(roc_lr), 4)
+auc_inla <- round(pROC::auc(roc_inla), 4)
+
+# ─────────────────────────────────────────────
+# 7. PLOT (ESTILO ARTÍCULO CIENTÍFICO)
+# ─────────────────────────────────────────────
+p <- ggplot(df_plot, aes(x = FPR, y = TPR, color = Modelo)) +
+  
+  geom_line(linewidth = 1.2) +
+  
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed",
+    color = "gray60"
+  ) +
+  
+  scale_color_manual(values = c(
+    "LR" = "steelblue",
+    "INLA" = "tomato"
+  )) +
+  
+  coord_equal() +
+  
+  labs(
+    title = "Curva ROC",
+    subtitle = paste0(
+      "LR AUC = ", auc_lr,
+      " | INLA AUC = ", auc_inla
+    ),
+    x = "1 - Especificidad (FPR)",
+    y = "Sensibilidad (TPR)",
+    color = "Modelo"
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  
+  theme(
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    legend.position = c(0.85, 0.15),
+    legend.background = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# Mostrar gráfico
+print(p)
+
+# ─────────────────────────────────────────────
+# 8. EXPORTAR (CALIDAD PUBLICACIÓN)
+# ─────────────────────────────────────────────
+ggsave(
+  filename = "D:/Edgar/Maestria/Semestre 3/Seminario II/Img/ROC_LR_vs_INLA.png",
+  plot     = p,
+  width    = 6,
+  height   = 5,
+  dpi      = 1200
+)
+
+```
+
+Para validar la utilidad práctica de los mapas, se utiliza el Índice de Densidad de Susceptibilidad (SCAI - Susceptibility Concept Area Index). El SCAI es una herramienta de validación externa que relaciona el porcentaje de área de cada clase de susceptibilidad con el porcentaje de focos de deforestación reales presentes en dicha clase.
+
+```{r}
+
+
+# ─────────────────────────────
+# 1. CARGAR RASTERS
+# ─────────────────────────────
+sus_inla      <- rast("D:/Tesis Maestria/VariablesProyecto/Raster/ResultadoINLA/INLAMf.tif")
+sus_lr        <- rast("D:/Tesis Maestria/VariablesProyecto/Raster/SUS_LR.tif")
+deforestacion <- rast("D:/Tesis Maestria/VariablesProyecto/Deforestacion_IN.tif")
+
+# ─────────────────────────────
+# 2. ÁREA POR PIXEL EN KM²
+# ─────────────────────────────
+pixel_m2  <- 30.716988 * 30.716988
+pixel_km2 <- pixel_m2 / 1e6
+
+# ─────────────────────────────
+# 3. FUNCIÓN PARA CALCULAR SCAI
+# ─────────────────────────────
+calcular_scai <- function(susceptibilidad, deforestacion, pixel_km2, modelo_nombre) {
+  
+  # Convertir deforestación a binario y alinear
+  defor_binario <- ifel(!is.na(deforestacion), 1, 0)
+  defor_binario <- project(defor_binario, crs(susceptibilidad), method = "near")
+  defor_binario <- resample(defor_binario, susceptibilidad, method = "near")
+  defor_binario <- crop(defor_binario, susceptibilidad)
+  defor_binario <- mask(defor_binario, susceptibilidad)
+  
+  # Reclasificar susceptibilidad
+  rcl <- matrix(c(
+    0.0, 0.2, 1,
+    0.2, 0.4, 2,
+    0.4, 0.6, 3,
+    0.6, 0.8, 4,
+    0.8, 1.0, 5
+  ), ncol = 3, byrow = TRUE)
+  
+  clases <- classify(susceptibilidad, rcl, include.lowest = TRUE)
+  
+  # Stack y dataframe
+  stack_r        <- c(clases, defor_binario)
+  names(stack_r) <- c("clase", "defor")
+  df             <- as.data.frame(stack_r, na.rm = TRUE)
+  
+  # Frecuencias
+  freq_clases <- df %>%
+    group_by(clase) %>%
+    summarise(n_total = n())
+  
+  defor_por_clase <- df %>%
+    filter(defor == 1) %>%
+    group_by(clase) %>%
+    summarise(n_defor = n())
+  
+  total_pixeles <- sum(freq_clases$n_total)
+  total_defor   <- sum(defor_por_clase$n_defor)
+  
+  # Calcular SCAI
+  scai_df <- freq_clases %>%
+    left_join(defor_por_clase, by = "clase") %>%
+    mutate(
+      Modelo     = modelo_nombre,
+      n_defor    = replace_na(n_defor, 0),
+      area_total = n_total * pixel_km2,
+      pct_area   = (n_total / total_pixeles) * 100,
+      area_defor = n_defor * pixel_km2,
+      pct_defor  = (n_defor / total_defor) * 100,
+      SCAI       = ifelse(pct_defor == 0, NA, pct_area / pct_defor),
+      Rango      = case_when(
+        clase == 1 ~ "0.0 - 0.2 (Muy baja)",
+        clase == 2 ~ "0.2 - 0.4 (Baja)",
+        clase == 3 ~ "0.4 - 0.6 (Media)",
+        clase == 4 ~ "0.6 - 0.8 (Alta)",
+        clase == 5 ~ "0.8 - 1.0 (Muy alta)"
+      )
+    ) %>%
+    select(Modelo, clase, Rango, area_total, area_defor, pct_area, pct_defor, SCAI)
+  
+  return(scai_df)
+}
+
+# ─────────────────────────────
+# 4. CALCULAR PARA AMBOS MODELOS
+# ─────────────────────────────
+scai_inla <- calcular_scai(sus_inla, deforestacion, pixel_km2, "INLA-SPDE")
+scai_lr   <- calcular_scai(sus_lr,   deforestacion, pixel_km2, "LR")
+
+# ─────────────────────────────
+# 5. COMBINAR EN UNA SOLA TABLA
+# ─────────────────────────────
+scai_combined <- bind_rows(scai_lr, scai_inla) %>%
+  arrange(Modelo, clase)
+
+# ─────────────────────────────
+# 6. TABLA WIDE (LR y INLA lado a lado)
+# ─────────────────────────────
+scai_wide <- scai_combined %>%
+  select(Rango, Modelo, area_total, pct_area, area_defor, pct_defor, SCAI) %>%
+  tidyr::pivot_wider(
+    names_from  = Modelo,
+    values_from = c(area_total, pct_area, area_defor, pct_defor, SCAI),
+    names_glue  = "{Modelo}_{.value}"
+  ) %>%
+  select(
+    Rango,
+    `LR_area_total`, `LR_pct_area`, `LR_area_defor`, `LR_pct_defor`, `LR_SCAI`,
+    `INLA-SPDE_area_total`, `INLA-SPDE_pct_area`,
+    `INLA-SPDE_area_defor`, `INLA-SPDE_pct_defor`, `INLA-SPDE_SCAI`
+  )
+
+# ─────────────────────────────
+# 7. RESULTADOS
+# ─────────────────────────────
+cat("\n===== SCAI - TABLA LARGA =====\n\n")
+print(scai_combined)
+
+cat("\n===== SCAI - TABLA WIDE (LR vs INLA) =====\n\n")
+print(scai_wide)
+
+# ─────────────────────────────
+# 8. EXPORTAR
+# ─────────────────────────────
+write.csv(scai_combined,
+          "D:/Edgar/Maestria/Semestre 3/Seminario II/Img/SCAI_ambos.csv",
+          row.names = FALSE)
+
+write.csv(scai_wide,
+          "D:/Edgar/Maestria/Semestre 3/Seminario II/Img/SCAI_wide.csv",
+          row.names = FALSE)
+```
